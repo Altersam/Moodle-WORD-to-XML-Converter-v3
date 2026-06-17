@@ -65,21 +65,16 @@ jobs:
       contents: write
 
     steps:
-      - name: Download Windows artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: MoodleConverter.exe
-
-      - name: Download macOS artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: MoodleConverter-mac.zip
+          path: artifacts
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            MoodleConverter.exe
-            MoodleConverter-mac.zip
+            artifacts/MoodleConverter.exe/MoodleConverter.exe
+            artifacts/MoodleConverter-mac.zip/MoodleConverter-mac.zip
           draft: false
           prerelease: false
