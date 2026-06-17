@@ -9,7 +9,7 @@ import sys
 import re
 import unicodedata
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Dict
 from copy import deepcopy
 
 from PyQt5.QtWidgets import (
@@ -87,7 +87,7 @@ COLOR_ERROR   = QColor(255, 220, 220)
 class ParsedQuestion:
     """Один вопрос, извлечённый из docx."""
     __slots__ = ('name', 'grade', 'marker', 'subcategory',
-                 'content', 'auto_type', 'errors', 'line_num', 'selected')
+                 'content', 'auto_type', 'errors', 'line_num', 'selected', 'image_data')
 
     def __init__(self):
         self.name: str = ''
@@ -98,7 +98,8 @@ class ParsedQuestion:
         self.auto_type: str = ''
         self.errors: List[str] = []
         self.line_num: int = 0
-        self.selected: bool = True  # По умолчанию все вопросы выбраны
+        self.selected: bool = True
+        self.image_data: Dict[str, str] = {}
 
 
 def parse_docx_preview(docx_path: str) -> tuple:
@@ -109,6 +110,13 @@ def parse_docx_preview(docx_path: str) -> tuple:
     if docxlatex is None:
         errors.append('docxlatex не установлен (pip install docxlatex)')
         return questions, errors
+
+    try:
+        from universal_moodle_converter_v3_stable import ImageProcessor
+        img_proc = ImageProcessor()
+        image_data = img_proc.extract_images(docx_path)
+    except Exception as e:
+        image_data = {}
 
     try:
         doc = docxlatex.Document(docx_path)
@@ -174,6 +182,7 @@ def parse_docx_preview(docx_path: str) -> tuple:
             current_q.marker = current_marker
             current_q.subcategory = current_subcategory
             current_q.line_num = line_idx + 1
+            current_q.image_data = image_data
             gm = re.search(r'b=(\d+)', line)
             current_q.grade = float(gm.group(1)) if gm else 1.0
             continue
@@ -509,6 +518,7 @@ class MainWindow(QMainWindow):
         self.tree.setFont(QFont('Segoe UI', 9))
         self.tree.itemChanged.connect(self._on_item_check_changed)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
+        self.tree.currentItemChanged.connect(self._on_tree_current_changed)
         
         v_splitter.addWidget(self.tree)
 
@@ -517,7 +527,7 @@ class MainWindow(QMainWindow):
         self.log_text.setMaximumHeight(200)
         self.log_text.setFont(QFont('Consolas', 9))
         v_splitter.addWidget(self.log_text)
-        v_splitter.setSizes([550, 200])
+        v_splitter.setSizes([150, 500, 150])
         
         # Правая панель: предпросмотр Moodle
         preview_group = QGroupBox('Предпросмотр Moodle')
@@ -855,28 +865,52 @@ class MainWindow(QMainWindow):
         self.lbl_selected.setText(f'Выбрано: {count} / {len(self.questions)}')
         self.status_label.setText(f'Выбрано вопросов: {count} / {len(self.questions)}')
 
-    def _on_tree_item_clicked(self, item, column):
+    def _resolve_question_idx(self, item):
         idx = item.data(0, Qt.UserRole)
-        if idx is not None and not isinstance(idx, dict):
-            if idx < len(self.questions):
-                self._update_preview(idx)
+        if idx is None or isinstance(idx, dict):
+            parent = item.parent()
+            if parent is not None:
+                idx = parent.data(0, Qt.UserRole)
+        if idx is not None and not isinstance(idx, dict) and idx < len(self.questions):
+            return idx
+        return None
+
+    def _on_tree_item_clicked(self, item, column):
+        idx = self._resolve_question_idx(item)
+        print(f'[CLICK] item={item.text(0)[:40]}, col={column}, idx={idx}')
+        self.log_text.append(f'[CLICK] item={item.text(0)[:30]}, column={column}, resolved_idx={idx}')
+        if idx is not None:
+            self._update_preview(idx)
+    
+    def _on_tree_current_changed(self, current, previous):
+        if current is None:
+            return
+        idx = self._resolve_question_idx(current)
+        print(f'[CURRENT] item={current.text(0)[:40]}, idx={idx}')
+        if idx is not None:
+            self._update_preview(idx)
     
     def _update_preview(self, q_idx):
+        self.log_text.append(f'[PREVIEW] _update_preview called for idx={q_idx}')
         q = self.questions[q_idx]
         
         if q.errors:
-            self.preview_web.setHtml(f'<div style="color:red; padding:10px;"><b>Ошибки в вопросе:</b><br>{ "<br>".join(q.errors) }</div>')
+            self.log_text.append(f'[PREVIEW] Question has {len(q.errors)} errors, showing error view')
+            self.preview_web.setHtml(f'<!DOCTYPE html><html><body style="font-family:sans-serif; padding:10px;"><div style="color:red; padding:10px;"><b>Ошибки в вопросе:</b><br>{ "<br>".join(q.errors) }</div></body></html>')
             return
         
         try:
             from universal_moodle_converter_v3_stable import XMLGenerator
             
             gen = XMLGenerator()
+            gen.set_image_data(q.image_data)
             
             marker = q.marker
             if not marker:
                 from universal_moodle_converter_v3_stable import QuestionTypeDetector
                 marker = QuestionTypeDetector.detect(q.content, '', marker)
+            
+            self.log_text.append(f'[PREVIEW] marker={marker}, name={q.name[:30]}, content_lines={len(q.content)}')
             
             grade = q.grade if q.grade else 1.0
             
@@ -900,38 +934,53 @@ class MainWindow(QMainWindow):
                 gen.create_multichoice(q.name, q.content, grade, single=True, penalty_wrong=1.0)
             
             xml_str = etree.tostring(gen.root, pretty_print=True, encoding='unicode')
+            self.log_text.append(f'[PREVIEW] XML generated, len={len(xml_str)}, questions_in_root={len(gen.root)}')
             
             html = self._xml_to_moodle_preview(q.name, q.content, marker, xml_str, q.marker)
+            self.log_text.append(f'[PREVIEW] HTML generated, len={len(html)}, calling setHtml...')
+            self.log_text.append(f'[PREVIEW] HTML start: {html[:200]}...')
             self.preview_web.setHtml(html)
-            
+            self.preview_web.update()
+            QApplication.processEvents()
+            self.log_text.append(f'[PREVIEW] setHtml called successfully')
+        
         except Exception as e:
-            self.preview_web.setHtml(f'<div style="color:red; padding:10px;">Ошибка: {str(e)}</div>')
+            tb = traceback.format_exc()
+            self.log_text.append(f'[PREVIEW ERROR] {e}\n{tb}')
+            self.preview_web.setHtml(f'<!DOCTYPE html><html><body style="font-family:sans-serif; padding:10px;"><div style="color:red; padding:10px;">Ошибка: {str(e)}</div></body></html>')
     
     def _xml_to_moodle_preview(self, name, content, marker, xml_str, original_marker=''):
+        tree = etree.fromstring(xml_str)
+        q_elem = tree.find('.//question')
+        qtype = q_elem.get('type', '') if q_elem is not None else ''
+        
         def process_qtext(text, xml_elem):
             text = text.replace('\n', '<br>')
             
-            images = xml_elem.findall('.//image')
-            for idx, img in enumerate(images):
+            images_html = ''
+            
+            if hasattr(xml_elem, 'image_data') and xml_elem.image_data:
+                for img_key, img_data in xml_elem.image_data.items():
+                    images_html += f'<img src="data:image/png;base64,{img_data}" style="max-width:300px; margin:5px;">'
+            
+            for img in xml_elem.findall('.//image'):
                 if img.text:
-                    text = text.replace(f'_IMAGE_', f'<img src="data:image/png;base64,{img.text}" style="max-width:400px; margin:5px;">')
+                    images_html += f'<img src="data:image/png;base64,{img.text}" style="max-width:300px; margin:5px;">'
             
-            text = re.sub(r'_@@PLUGINFILE@@/[^_]+_IMAGE_', '', text)
+            for f in xml_elem.findall('.//file'):
+                if f.text:
+                    images_html += f'<img src="data:image/png;base64,{f.text}" style="max-width:300px; margin:5px;">'
             
-            return text
+            text = text.replace('_@@PLUGINFILE@@/[^_]+_IMAGE_', '')
+            text = text.replace('_IMAGE_', '')
+            text = re.sub(r'IMAGE#\d+-image\d+', '<b>[IMAGE]</b>', text)
+            
+            return images_html + text if images_html else text
         
         moodle_css = '''
         <style>
         * { box-sizing: border-box; }
-        body { 
-            font-family: 'Segoe UI', Arial, sans-serif; 
-            font-size: 14px; 
-            line-height: 1.5; 
-            color: #333;
-            padding: 15px;
-            background: #fff;
-        }
-        .que { 
+        .que {
             background: #f9f9f9; 
             border: 1px solid #ddd; 
             border-radius: 4px; 
@@ -1052,17 +1101,18 @@ class MainWindow(QMainWindow):
         .feedback.correct { 
             background: #d4edda; 
             border: 1px solid #c3e6cb; 
-        }
+}
         .feedback.incorrect { 
             background: #f8d7da; 
             border: 1px solid #f5c6cb; 
         }
         </style>
         '''
-        
+
         tree = etree.fromstring(xml_str)
-        
+
         q_elem = tree.find('.//question')
+        
         if q_elem is None:
             return f'{moodle_css}<div style="color:red;">XML не содержит вопросов</div>'
         
@@ -1106,36 +1156,81 @@ class MainWindow(QMainWindow):
             
             subqs = q_elem.findall('.//subquestion')
             
-            all_answers = []
+            left_items = []
+            all_right = []
+            
+            def process_subq_text(text):
+                text = text.replace('\n', '<br>')
+                images = q_elem.findall('.//image')
+                files = q_elem.findall('.//file')
+                all_imgs = list(images) + list(files)
+                for idx, img in enumerate(all_imgs):
+                    img_data = img.text
+                    if img_data:
+                        text = text.replace(f'_IMAGE_', f'<img src="data:image/png;base64,{img_data}" style="max-width:200px; margin:3px;">')
+                text = re.sub(r'_@@PLUGINFILE@@/[^_]+_IMAGE_', '', text)
+                return text
+            
             for sq in subqs:
                 text = ''.join(sq.find('text').itertext()) if sq.find('text') is not None else ''
                 ans_text = ''.join(sq.find('.//answer/text').itertext()) if sq.find('.//answer') is not None else ''
-                all_answers.append((text, ans_text))
+                if text.strip():
+                    left_items.append((text, ans_text.strip()))
+                if ans_text.strip():
+                    all_right.append(ans_text.strip())
             
-            distractors = []
             for ans in q_elem.findall('.//answer'):
                 text = ''.join(ans.find('text').itertext()) if ans.find('text') is not None else ''
-                if text and not any(t[1] == text for t in all_answers):
-                    distractors.append(text)
+                if text.strip() and text.strip() not in all_right:
+                    all_right.append(text.strip())
+            
+            all_right_shuffled = all_right[:]
+            import random
+            random.seed(42)
+            random.shuffle(all_right_shuffled)
             
             html += f'<div class="que matching" style="border-left:4px solid #f39c12;">'
             html += f'<div class="formulation"><h3>{name}</h3>'
             html += f'<div class="qtext">{process_qtext(qtext, q_elem)}</div></div>'
-            html += '<div class="ablock"><table class="matching-table">'
+            html += '<div class="ablock">'
             
-            for idx, (text, correct_ans) in enumerate(all_answers):
-                all_opts = [correct_ans] + [d for d in distractors if d != correct_ans]
-                
-                html += f'<tr><td style="padding:5px;"><b>{text}</b></td><td style="padding:5px;">'
-                html += f'<select><option>-- выберите --</option>'
-                for opt in all_opts:
-                    if opt == correct_ans:
-                        html += f'<option selected>{opt}</option>'
-                    else:
-                        html += f'<option>{opt}</option>'
-                html += '</select></td></tr>'
+            html += '<div style="display:flex; gap:40px; margin-bottom:15px;">'
             
-            html += '</table></div></div>'
+            html += '<div style="flex:1;"><strong>Левая колонка:</strong><div style="background:#e8f4f8; padding:10px; border-radius:4px;">'
+            for text, _ in left_items:
+                html += f'<div style="padding:6px 10px; margin:3px 0; border-radius:3px;">{process_subq_text(text)}</div>'
+            html += '</div></div>'
+            
+            html += '<div style="flex:1;"><strong>Правая колонка:</strong><div style="background:#f5f5f5; padding:10px; border-radius:4px;">'
+            for item in all_right_shuffled:
+                is_correct = any(correct.strip() == item.strip() for _, correct in left_items)
+                bg = '#d4edda' if is_correct else '#fff'
+                border = '#27ae60' if is_correct else '#ccc'
+                html += f'<div style="background:{bg}; padding:6px 10px; margin:3px 0; border-radius:3px; border:1px solid {border};">{item.strip()}</div>'
+            html += '</div></div>'
+            
+            html += '</div>'
+            
+            html += '<div style="border:2px solid #f39c12; padding:15px; margin-top:15px; background:#fff9e6;">'
+            html += '<p style="margin:0 0 10px 0;"><strong>Выберите соответствие:</strong></p>'
+            
+            if not left_items:
+                html += f'<div style="color:red; padding:10px;">Нет данных для отображения</div>'
+            else:
+                for idx, (text, correct_ans) in enumerate(left_items):
+                    html += f'<div style="margin:8px 0;">'
+                    html += f'<span style="font-weight:bold; display:inline-block; min-width:180px; vertical-align:middle;">{process_subq_text(text)}</span>'
+                    html += f'<select style="padding:6px 10px; border:2px solid #333; border-radius:4px; min-width:220px; font-size:14px;">'
+                    html += '<option value="">-- выберите --</option>'
+                    for opt in all_right_shuffled:
+                        is_sel = 'selected="selected"' if opt.strip() == correct_ans.strip() else ''
+                        html += f'<option {is_sel}>{opt.strip()}</option>'
+                    html += '</select>'
+                    html += '</div>'
+            
+            html += '</div>'
+            
+            html += '</div></div>'
             
         elif qtype == 'ddmatch':
             qt = q_elem.find('.//questiontext')
@@ -1184,7 +1279,8 @@ class MainWindow(QMainWindow):
             
         elif qtype == 'gapselect':
             qt = q_elem.find('.//questiontext')
-            qtext = ''.join(qt.itertext()) if qt is not None else ''
+            text_elem = qt.find('text') if qt is not None else None
+            qtext = text_elem.text if text_elem is not None and text_elem.text else ''
             
             answer_key = ''
             for line in content:
@@ -1203,39 +1299,53 @@ class MainWindow(QMainWindow):
             groups = {}
             for opt in selectopts:
                 text = ''.join(opt.find('text').itertext()).strip()
-                group = opt.get('group', '1')
+                group_elem = opt.find('group')
+                group = group_elem.text if group_elem is not None else '1'
                 if group not in groups:
                     groups[group] = []
                 groups[group].append(text)
             
-            sorted_groups = sorted(groups.items())
+            groups = list(groups.items())
             
-            def replace_gap(match):
-                pos = int(match.group(1))
-                group_num = (pos - 2) // 4 + 1
-                
-                g_idx = group_num - 1
-                if g_idx >= len(sorted_groups):
-                    return match.group(0)
-                
-                g, opts = sorted_groups[g_idx]
-                correct_letter = answer_key[g_idx] if g_idx < len(answer_key) else ''
-                
-                html = '<select style="padding:3px 5px; border:1px solid #999; border-radius:3px; background:#fff; min-width:100px;"><option>--</option>'
-                for text in opts:
-                    letter_match = re.match(r'^([A-DА-Г])', text)
-                    letter = letter_match.group(1) if letter_match else ''
+            class GapReplacer:
+                def __init__(self):
+                    self.idx = 0
+                def __call__(self, match):
+                    pos = int(match.group(1))
+                    idx = self.idx
+                    self.idx += 1
                     
-                    is_correct = (has_cyrillic and letter == correct_letter) or (not has_cyrillic and letter.upper() == correct_letter.upper())
+                    group_num = (pos - 2) // 4 + 1
+                    group_key = str(group_num)
                     
-                    if is_correct:
-                        html += f'<option selected>{text}</option>'
-                    else:
-                        html += f'<option>{text}</option>'
-                html += '</select>'
-                return html
+                    
+                    
+                    g_opts = None
+                    for g, opts in groups:
+                        if g == group_key:
+                            g_opts = opts
+                            break
+                    
+                    if g_opts is None:
+                        return match.group(0)
+                    
+                    correct_letter = answer_key[idx] if idx < len(answer_key) else ''
+                    
+                    html = '<select style="padding:3px 5px; border:1px solid #999; border-radius:3px; background:#fff; min-width:100px;"><option>--</option>'
+                    for text in g_opts:
+                        letter_match = re.match(r'^([A-DА-Г])', text)
+                        letter = letter_match.group(1) if letter_match else ''
+                        
+                        is_correct = (has_cyrillic and letter == correct_letter) or (not has_cyrillic and letter.upper() == correct_letter.upper())
+                        
+                        if is_correct:
+                            html += f'<option selected>{text}</option>'
+                        else:
+                            html += f'<option>{text}</option>'
+                    html += '</select>'
+                    return html
             
-            qtext = re.sub(r'\[\[(\d+)\]\]', replace_gap, qtext)
+            qtext = re.sub(r'\[\[(\d+)\]\]', GapReplacer(), qtext)
             
             html += f'<div class="que gapselect">'
             html += f'<div class="formulation"><h3>{name}</h3>'
@@ -1278,7 +1388,7 @@ class MainWindow(QMainWindow):
         else:
             html += f'<div class="que">Тип: {qtype} — предпросмотр недоступен</div>'
         
-        return html
+        return f'<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif; padding:10px;">{html}</body></html>'
 
 
 # ============================================================
