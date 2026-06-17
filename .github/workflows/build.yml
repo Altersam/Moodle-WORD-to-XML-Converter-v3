@@ -7,20 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        os: [windows-latest, macos-latest]
-        include:
-          - os: windows-latest
-            artifact_name: MoodleConverter.exe
-            build_cmd: pyinstaller --onefile --windowed --name MoodleConverter --add-data "universal_moodle_converter_v3_stable.py;." converter_gui.py
-          - os: macos-latest
-            artifact_name: MoodleConverter.app
-            build_cmd: pyinstaller --windowed --name MoodleConverter --add-data "universal_moodle_converter_v3_stable.py:." converter_gui.py
-
-    runs-on: ${{ matrix.os }}
-
+  build-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,36 +20,66 @@ jobs:
       - name: Install dependencies
         run: pip install PyQt5 PyQtWebEngine lxml python-docx docxlatex pyinstaller
 
-      - name: Install PyQt5 (macOS specific)
-        if: runner.os == 'macOS'
-        run: pip install PyQt5==5.15.11 PyQtWebEngine
-
-      - name: Build
-        run: ${{ matrix.build_cmd }}
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name MoodleConverter --add-data "universal_moodle_converter_v3_stable.py;." converter_gui.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/
+          name: MoodleConverter.exe
+          path: dist/MoodleConverter.exe
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt5==5.15.11 PyQtWebEngine lxml python-docx docxlatex pyinstaller
+
+      - name: Build app
+        run: pyinstaller --windowed --name MoodleConverter --add-data "universal_moodle_converter_v3_stable.py:." converter_gui.py
+
+      - name: Zip .app bundle
+        run: cd dist && zip -r MoodleConverter-mac.zip MoodleConverter.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoodleConverter-mac.zip
+          path: dist/MoodleConverter-mac.zip
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
 
     steps:
-      - name: Download all artifacts
+      - name: Download Windows artifact
         uses: actions/download-artifact@v4
+        with:
+          name: MoodleConverter.exe
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MoodleConverter-mac.zip
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            MoodleConverter.exe/MoodleConverter.exe
-            MoodleConverter.app/MoodleConverter.app
+            MoodleConverter.exe
+            MoodleConverter-mac.zip
           draft: false
           prerelease: false
